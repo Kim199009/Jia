@@ -9,63 +9,90 @@ on:
 
 permissions:
   issues: write
+  contents: write   # 写入心跳文件需要
 
 jobs:
   remind:
     runs-on: ubuntu-latest
     steps:
+      # ① 发送报时提醒
       - name: 发送报时提醒
         uses: actions/github-script@v7
         with:
           script: |
-            // 计算北京时间（UTC+8）
-            const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
+            const now = new Date(Date.now() + 8 * 60 * 60 * 1000); // 北京时间
             const pad = (n) => String(n).padStart(2, '0');
             const weekdays = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
             const dateStr = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}`;
             const timeStr = `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}`;
             const weekday = weekdays[now.getUTCDay()];
             const body = `你好，现在是北京时间 ${dateStr}（${weekday}）${timeStr}。`;
-
             const { owner, repo } = context.repo;
-            const title = '⏰ 定时报时提醒';
 
-            // 查找已存在的报时 Issue（带 time-reminder 标签），有就评论，没有就新建
+            // 查找带 time-reminder 标签的 Issue，有就评论，没有就新建
             const existing = await github.rest.issues.listForRepo({
-              owner,
-              repo,
-              state: 'open',
-              labels: 'time-reminder',
-              per_page: 1,
+              owner, repo, state: 'open', labels: 'time-reminder', per_page: 1,
             });
-
             if (existing.data.length > 0) {
               await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: existing.data[0].number,
-                body,
+                owner, repo, issue_number: existing.data[0].number, body,
               });
               console.log(`已在 Issue #${existing.data[0].number} 评论：${body}`);
             } else {
-              // 确保标签存在
               try {
                 await github.rest.issues.getLabel({ owner, repo, name: 'time-reminder' });
               } catch (e) {
                 await github.rest.issues.createLabel({
-                  owner,
-                  repo,
-                  name: 'time-reminder',
-                  color: '0E8A16',
-                  description: '定时报时提醒',
+                  owner, repo, name: 'time-reminder', color: '0E8A16', description: '定时报时提醒',
                 });
               }
               const created = await github.rest.issues.create({
-                owner,
-                repo,
-                title,
+                owner, repo, title: '⏰ 定时报时提醒',
                 body: `这个 Issue 用于接收定时报时提醒，每次提醒会作为评论追加在下方。\n\n${body}`,
                 labels: ['time-reminder'],
               });
               console.log(`已创建 Issue #${created.data.number}：${body}`);
             }
+
+      # ② 心跳保活：更新 HEARTBEAT.md（每次运行产生一次 commit，
+      #    既能防止仓库 60 天无提交导致定时任务被自动停用，
+      #    也提供一个「最后成功运行时间」的记录可随时查看）
+      - name: 更新心跳文件
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
+            const pad = (n) => String(n).padStart(2, '0');
+            const stamp = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())} ` +
+                          `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())} (北京时间)`;
+            const { owner, repo } = context.repo;
+            const path = 'HEARTBEAT.md';
+            const content = Buffer.from(`# 心跳记录\n\n最后一次成功运行：${stamp}\n`).toString('base64');
+
+            let sha;
+            try {
+              const f = await github.rest.repos.getContent({ owner, repo, path });
+              sha = f.data.sha;
+            } catch (e) { /* 文件还不存在，首次创建 */ }
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path,
+              message: `chore: 心跳保活 ${stamp}`,
+              content, sha,
+              branch: context.ref.replace('refs/heads/', ''),
+            });
+            console.log(`心跳已更新：${stamp}`);
+
+      # ③ 失败告警：上面任意一步出错时，自动开一个 Issue 提醒你（GitHub 默认也会发邮件）
+      - name: 失败时告警
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner, repo,
+              title: `⚠️ 报时提醒运行失败 - ${new Date().toISOString().slice(0, 10)}`,
+              body: `定时报时工作流本次运行失败，请检查。\n\n运行详情：${runUrl}`,
+            });
